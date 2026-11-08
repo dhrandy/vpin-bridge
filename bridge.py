@@ -27,6 +27,12 @@ Endpoints (all under /api, except /health):
   GET  /api/games/json
     List tables as JSON, from cabinet GET /api/v1/games
     (id + gameDisplayName, for picking a table to play)
+  GET  /api/highscores?gameId=<id>
+    High scores, from cabinet GET /api/v1/export/highscores/plain.
+    Returns {"ok": true, "highscores": [...]} parsed from the plain
+    text export (each line one entry, with its score), or
+    {"ok": true, "raw": "<text>"} if the text cannot be parsed.
+    Optional gameId filters to one table.
   POST /api/play
     JSON {"gameId": <int>}. Launches a table via the frontend,
     cabinet GET /api/v1/frontend/launch/<gameId>.
@@ -80,6 +86,7 @@ real import. DRY_RUN=true (default in compose) refuses all uploads.
 """
 import json
 import os
+import re
 import sys
 import urllib.request
 import urllib.error
@@ -129,6 +136,32 @@ def cabinet_put_json(path, payload):
             return json.loads(body.decode("utf-8"))
         except Exception:
             return {"raw": body.decode("utf-8", "replace")}
+
+
+def parse_highscores_plain(text):
+    """Parse the cabinet's plain-text highscores export into a list.
+
+    Each non-empty line is one high score entry. Returns a list of
+    {"text": <line>, "score": <int or None>} dicts, or None if no
+    line looks like a score entry, so the caller can fall back to
+    returning the raw text.
+    """
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        nums = re.findall(r"[\d,]+", line)
+        score = None
+        if nums:
+            try:
+                score = int(nums[-1].replace(",", ""))
+            except ValueError:
+                score = None
+        if score is None:
+            continue
+        entries.append({"text": line, "score": score})
+    return entries if entries else None
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -184,6 +217,23 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, cabinet_get("/api/v1/export/tables/plain"))
                 except Exception:
                     return self._send(200, cabinet_get("/api/v1/games"))
+            if path == "/api/highscores":
+                query = parse_qs(urlparse(self.path).query)
+                game_id = query.get("gameId", [None])[0]
+                cabinet_path = "/api/v1/export/highscores/plain"
+                if game_id:
+                    cabinet_path += f"?gameId={game_id}"
+                try:
+                    result = cabinet_get(cabinet_path)
+                except Exception as e:
+                    return self._send(502, {"ok": False, "error": str(e)})
+                text = result.get("raw") if isinstance(result, dict) else None
+                if text is None:
+                    return self._send(200, {"ok": True, "highscores": result})
+                entries = parse_highscores_plain(text)
+                if entries is None:
+                    return self._send(200, {"ok": True, "raw": text})
+                return self._send(200, {"ok": True, "highscores": entries})
             return self._send(404, {"ok": False, "error": "not found"})
         except Exception as e:
             return self._send(500, {"ok": False, "error": str(e)})
