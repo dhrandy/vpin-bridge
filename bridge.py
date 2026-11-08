@@ -51,8 +51,12 @@ Endpoints (all under /api, except /health):
     genuinely new score appears after the bridge starts, so the
     existing top score is never mislabeled as the last score;
     "lastScoreInitials" and "lastScoreAt" (detection time) ride
-    along. The top-score fields ("score", "playerInitials") are
-    unchanged.
+    along. One exception: a table with exactly one recorded score
+    has its lastScore set to that score on the first fetch, since
+    a single recorded score is necessarily the most recent (only)
+    score; lastScoreAt is "" for that case because the export
+    carries no per-score time. The top-score fields ("score",
+    "playerInitials") are unchanged.
   POST /api/play
     JSON {"gameId": <int>}. Launches a table via the frontend,
     cabinet GET /api/v1/frontend/launch/<gameId>.
@@ -322,7 +326,13 @@ def parse_highscores_plain(text, last_played=None):
     Each entry also carries a private "_score_set" frozenset of all
     (score, initials) pairs on its line, for track_last_scores to
     compare against the previous fetch; the handler strips it via
-    track_last_scores before the entries are sent.
+    track_last_scores before the entries are sent. When a line has
+    exactly one populated score slot, the entry also carries a
+    private "_single_score" (score, initials) pair, so
+    track_last_scores can report it as the table's lastScore: a
+    single recorded score is necessarily the most recent (only)
+    score, so it needs no baseline. Lines with two or more slots
+    carry "_single_score" as None.
     Returns a list of
     {"gameId": int, "text": <gameDisplayName>, "score": <score1 int>,
     "playerInitials": <initials1>,
@@ -363,11 +373,13 @@ def parse_highscores_plain(text, last_played=None):
         else:
             lp_str = ""
             sort_key = _parse_play_date(created_at)
+        pairs = _highscore_pairs(fields)
         entries.append({"gameId": game_id, "text": name, "score": score,
                         "playerInitials": fields[3].strip(),
                         "createdAt": created_at, "lastPlayed": lp_str,
                         "_sort_key": sort_key,
-                        "_score_set": frozenset(_highscore_pairs(fields))})
+                        "_score_set": frozenset(pairs),
+                        "_single_score": pairs[0] if len(pairs) == 1 else None})
     if not entries:
         return None
     entries.sort(key=lambda e: e["_sort_key"], reverse=True)
@@ -394,14 +406,23 @@ def track_last_scores(entries):
     (int, or None), "lastScoreInitials" (str, "" when none) and
     "lastScoreAt" (ISO detection time, "" when none); a lastScore
     once detected persists across later unchanged fetches. The
-    "_score_set" scratch field is removed. State is in-memory only
-    and is lost when the bridge restarts.
+    "_score_set" scratch field is removed. Exception: a table with
+    exactly one recorded score gets that score as its lastScore on
+    the first fetch (from the "_single_score" pair attached by
+    parse_highscores_plain), since a single recorded score is
+    necessarily the most recent (only) score; its lastScoreAt is
+    "" because the export carries no per-score time. A detected
+    lastScore always wins over the single-score fallback, and
+    once a table has two or more scores the fallback no longer
+    applies. State is in-memory only and is lost when the bridge
+    restarts.
     """
     now = datetime.now().isoformat(timespec="seconds")
     with _SCORE_STATE_LOCK:
         for entry in entries:
             game_id = entry["gameId"]
             current = entry.pop("_score_set", frozenset())
+            single = entry.pop("_single_score", None)
             prev = _SCORE_BASELINE.get(game_id)
             if prev is None:
                 # First sight of this table: baseline only, never
@@ -418,7 +439,12 @@ def track_last_scores(entries):
                         "detectedAt": now}
                 _SCORE_BASELINE[game_id] = set(current)
             last = _LAST_SCORE.get(game_id)
-            if last is None:
+            if last is None and single is not None:
+                # Exactly one recorded score: it is the last score.
+                entry["lastScore"] = single[0]
+                entry["lastScoreInitials"] = single[1]
+                entry["lastScoreAt"] = ""
+            elif last is None:
                 entry["lastScore"] = None
                 entry["lastScoreInitials"] = ""
                 entry["lastScoreAt"] = ""
