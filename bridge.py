@@ -43,6 +43,10 @@ Endpoints (all under /api, except /health):
   POST /api/puppack
     Multipart, field "file" = PuP pack archive.
     Forwards to POST /api/v1/puppacks/upload, assetType=PUP_PACK
+  POST /api/rom?gameId=<id>
+    Multipart, field "file" = ROM zip (e.g. gldneye.zip).
+    Forwards to POST /api/v1/assets/<id>/upload/0?assetType=ROM.
+    Blocked by DRY_RUN, like the other uploads.
   POST /api/media?screen=PlayField|Wheel|BackGlass&append=false
     Multipart, field "file" = media file.
     Forwards to POST /api/v1/media/upload/<SCREEN>/<append>
@@ -274,6 +278,21 @@ class Handler(BaseHTTPRequestHandler):
                 with urllib.request.urlopen(req, timeout=300) as resp:
                     result = json.loads(resp.read().decode("utf-8"))
                 return self._send(200, {"ok": True, "result": result})
+            except Exception as e:
+                return self._send(502, {"ok": False, "error": str(e)})
+        if path == "/api/rom":
+            game_id = query.get("gameId", [None])[0]
+            if not game_id:
+                return self._send(400, {"ok": False, "error": "gameId query param required"})
+            try:
+                req = urllib.request.Request(
+                    cabinet_base() + f"/api/v1/assets/{game_id}/upload/0?assetType=ROM",
+                    data=body, headers={"Content-Type": content_type}, method="POST")
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+                return self._send(200, {"ok": True, "result": result})
+            except urllib.error.HTTPError as e:
+                return self._send(e.code, {"ok": False, "error": e.read().decode("utf-8", "replace")[:500]})
             except Exception as e:
                 return self._send(502, {"ok": False, "error": str(e)})
         return self._send(404, {"ok": False, "error": "not found"})
