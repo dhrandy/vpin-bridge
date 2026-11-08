@@ -32,7 +32,12 @@ Endpoints (all under /api, except /health):
     Returns {"ok": true, "highscores": [...]} parsed from the plain
     text export (each line one entry, with its score), or
     {"ok": true, "raw": "<text>"} if the text cannot be parsed.
-    Optional gameId filters to one table.
+    Each entry also carries the table's lastPlayed from the games
+    export (cabinet GET /api/v1/export/tables/plain), and entries
+    are sorted by lastPlayed descending, most recently played
+    first, so the first entry is the table last played. Tables
+    with no lastPlayed sort last. Optional gameId filters to
+    one table.
   POST /api/play
     JSON {"gameId": <int>}. Launches a table via the frontend,
     cabinet GET /api/v1/frontend/launch/<gameId>.
@@ -139,7 +144,57 @@ def cabinet_put_json(path, payload):
             return {"raw": body.decode("utf-8", "replace")}
 
 
-def parse_highscores_plain(text):
+def _parse_play_date(s):
+    """Parse a cabinet date like "Nov 8, 2026, 3:41:42 PM".
+
+    The cabinet writes a narrow no-break space (U+202F) before the
+    AM/PM marker, so all whitespace is normalized to a plain space
+    first. Returns a datetime, or datetime.min when the value is
+    empty or unparseable, so such entries sort last.
+    """
+    s = "".join(" " if ch.isspace() else ch for ch in (s or "")).strip()
+    if not s:
+        return datetime.min
+    try:
+        return datetime.strptime(s, "%b %d, %Y, %I:%M:%S %p")
+    except ValueError:
+        return datetime.min
+
+
+def parse_last_played_map(text):
+    """Parse the cabinet's games export into a gameId -> lastPlayed map.
+
+    The games export is semicolon-delimited CSV, one table per line,
+    with a header row that includes `id` and `lastPlayed` columns.
+    Returns a dict {gameId: (lastPlayed string as-is, parsed datetime)}.
+    The lastPlayed string is "" when the table has never been played.
+    Returns an empty dict if the header has no id/lastPlayed columns
+    or no rows parse, so the caller can fall back to the createdAt
+    sort instead of failing.
+    """
+    last_played = {}
+    lines = [l for l in text.splitlines() if l.strip()]
+    if not lines:
+        return last_played
+    header = lines[0].rstrip("\r").split(";")
+    if "id" not in header or "lastPlayed" not in header:
+        return last_played
+    id_idx = header.index("id")
+    lp_idx = header.index("lastPlayed")
+    for line in lines[1:]:
+        fields = line.rstrip("\r").split(";")
+        if len(fields) <= max(id_idx, lp_idx):
+            continue
+        try:
+            game_id = int(fields[id_idx].strip())
+        except ValueError:
+            continue
+        lp = fields[lp_idx].strip()
+        last_played[game_id] = (lp, _parse_play_date(lp))
+    return last_played
+
+
+def parse_highscores_plain(text, last_played=None):
     """Parse the cabinet's plain-text highscores export into a list.
 
     The export is semicolon-delimited CSV, one table per line, with
@@ -152,16 +207,22 @@ def parse_highscores_plain(text):
 
     The header line (starting with "gameId;") is skipped. For each
     data line the top score is score1 (field 4), with the top
-    player's initials in field 3. The createdAt field (field 2) is
-    when that table's top high score was recorded, the best available
-    proxy for when the table was last played. Entries are sorted by
-    createdAt descending, most recently played first; entries whose
-    createdAt cannot be parsed sort last. Returns a list of
+    player's initials in field 3.
+
+    The createdAt field (field 2) is the same export-generation time
+    on every line, so it cannot order tables by recency. When a
+    last_played map (from parse_last_played_map, built from the
+    games export) is given, each entry gets a "lastPlayed" field
+    (string as-is, "" when never played) and entries are sorted by
+    lastPlayed descending, most recently played first; entries with
+    no lastPlayed sort last. Without a map, entries keep the
+    createdAt sort as a fallback. Returns a list of
     {"gameId": int, "text": <gameDisplayName>, "score": <score1 int>,
     "playerInitials": <initials1>,
-    "createdAt": <createdAt string as-is>} dicts, or None if no data
-    line parses, so the caller can fall back to returning the raw
-    text.
+    "createdAt": <createdAt string as-is>,
+    "lastPlayed": <lastPlayed string as-is>} dicts, or None if no
+    data line parses, so the caller can fall back to returning the
+    raw text.
     """
     entries = []
     for line in text.splitlines():
@@ -185,13 +246,16 @@ def parse_highscores_plain(text):
         except ValueError:
             continue
         created_at = fields[2].strip()
-        try:
-            parsed = datetime.strptime(created_at, "%b %d, %Y, %I:%M:%S %p")
-        except ValueError:
-            parsed = datetime.min
+        if last_played:
+            lp_str, lp_dt = last_played.get(game_id, ("", datetime.min))
+            sort_key = lp_dt
+        else:
+            lp_str = ""
+            sort_key = _parse_play_date(created_at)
         entries.append({"gameId": game_id, "text": name, "score": score,
                         "playerInitials": fields[3].strip(),
-                        "createdAt": created_at, "_sort_key": parsed})
+                        "createdAt": created_at, "lastPlayed": lp_str,
+                        "_sort_key": sort_key})
     if not entries:
         return None
     entries.sort(key=lambda e: e["_sort_key"], reverse=True)
@@ -266,7 +330,20 @@ class Handler(BaseHTTPRequestHandler):
                 text = result.get("raw") if isinstance(result, dict) else None
                 if text is None:
                     return self._send(200, {"ok": True, "highscores": result})
-                entries = parse_highscores_plain(text)
+                # The highscores export's createdAt is the same export
+                # time on every line, so it cannot order by recency.
+                # Pull the games export for the real per-table
+                # lastPlayed and sort by that instead. If the games
+                # fetch fails, fall back to the createdAt sort.
+                last_played = None
+                try:
+                    games = cabinet_get("/api/v1/export/tables/plain")
+                    games_text = games.get("raw") if isinstance(games, dict) else None
+                    if games_text:
+                        last_played = parse_last_played_map(games_text) or None
+                except Exception:
+                    last_played = None
+                entries = parse_highscores_plain(text, last_played)
                 if entries is None:
                     return self._send(200, {"ok": True, "raw": text})
                 return self._send(200, {"ok": True, "highscores": entries})
