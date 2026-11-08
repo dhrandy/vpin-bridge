@@ -58,10 +58,6 @@ Endpoints (all under /api, except /health):
     NOT blocked by DRY_RUN.
   GET  /api/playlists
     Cabinet GET /api/v1/playlists
-  DELETE /api/games/<gameId>
-    Delete a whole table, cabinet DELETE /api/v1/games/<id>.
-    NOT blocked by DRY_RUN. Only use when the user explicitly
-    says to delete that table.
   GET  /api/validations/<gameId>
     Live validation for a table, cabinet GET /api/v1/games/validations/<id>.
     Returns the current issue list, for example code 36 means the
@@ -187,28 +183,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"ok": False, "error": "not found"})
         except Exception as e:
             return self._send(500, {"ok": False, "error": str(e)})
-
-    def do_DELETE(self):
-        if not self._auth():
-            return self._send(401, {"ok": False, "error": "unauthorized"})
-        path = urlparse(self.path).path
-        parts = [p for p in path.split("/") if p]
-        if len(parts) == 3 and parts[0] == "api" and parts[1] == "games":
-            try:
-                req = urllib.request.Request(
-                    cabinet_base() + f"/api/v1/games/{parts[2]}", method="DELETE")
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    body = resp.read()
-                    try:
-                        result = json.loads(body.decode("utf-8"))
-                    except Exception:
-                        result = {"raw": body.decode("utf-8", "replace")}
-                return self._send(200, {"ok": True, "gameId": parts[2], "result": result})
-            except urllib.error.HTTPError as e:
-                return self._send(e.code, {"ok": False, "error": e.read().decode("utf-8", "replace")[:500]})
-            except Exception as e:
-                return self._send(502, {"ok": False, "error": str(e)})
-        return self._send(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):
         if not self._auth():
