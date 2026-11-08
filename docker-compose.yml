@@ -1,0 +1,22 @@
+services:
+  vpin-bridge:
+    image: python:3.12-slim
+    container_name: vpin-bridge
+    restart: unless-stopped
+    environment:
+      - BRIDGE_PORT=8080
+      - CABINET_IP=${CABINET_IP}
+      - VPIN_PORT=8089
+      - API_KEY=${API_KEY}
+      - DRY_RUN=true
+    ports:
+      - "8744:8080"
+    volumes:
+      - /path/to/vpin-bridge/app:/app
+      - /path/to/vpin-bridge/data:/data
+    command:
+      - sh
+      - -c
+      - |
+        python3 -c "import urllib.request; data=urllib.request.urlopen('https://raw.githubusercontent.com/dhrandy/vpin-bridge/main/bridge.py', timeout=30).read(); open('/app/bridge.py','wb').write(data); print('pulled bridge.py,', len(data), 'bytes', flush=True)"
+        exec python3 /app/bridge.py
