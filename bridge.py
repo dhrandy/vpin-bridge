@@ -44,6 +44,15 @@ Endpoints (all under /api, except /health):
     games export for sorting, so a played table does not sink to
     the bottom just because lastPlayed is blank; tables with
     neither date sort last. Optional gameId filters to one table.
+    Each entry also carries "lastScore": the score from the game
+    most recently played on that table, detected by comparing the
+    table's top-10 score list against the previous fetch (in-memory
+    state, lost on bridge restart). "lastScore" is null until a
+    genuinely new score appears after the bridge starts, so the
+    existing top score is never mislabeled as the last score;
+    "lastScoreInitials" and "lastScoreAt" (detection time) ride
+    along. The top-score fields ("score", "playerInitials") are
+    unchanged.
   POST /api/play
     JSON {"gameId": <int>}. Launches a table via the frontend,
     cabinet GET /api/v1/frontend/launch/<gameId>.
@@ -99,6 +108,7 @@ import json
 import os
 import re
 import sys
+import threading
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -110,6 +120,20 @@ CABINET_IP = os.environ.get("CABINET_IP", "")
 VPIN_PORT = os.environ.get("VPIN_PORT", "8089")
 API_KEY = os.environ.get("API_KEY", "")
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() in ("true", "1", "yes")
+
+# Last-score tracking state (in-memory only, lost on bridge restart).
+# _SCORE_BASELINE: gameId -> set of (score, initials) pairs from the
+# most recent highscores fetch. _LAST_SCORE: gameId -> the most
+# recently detected new score, {"score", "initials", "detectedAt"}.
+# A table is baselined on its first appearance; its lastScore stays
+# null until a genuinely new score appears on a later fetch, so the
+# existing top score is never mislabeled as the last score on
+# startup. Guarded by _SCORE_STATE_LOCK: the server is threaded
+# and two concurrent highscores fetches must not interleave a
+# compare-and-store.
+_SCORE_STATE_LOCK = threading.Lock()
+_SCORE_BASELINE = {}
+_LAST_SCORE = {}
 
 def cabinet_base():
     if not CABINET_IP:
@@ -242,6 +266,30 @@ def parse_game_names_map(text):
     return names
 
 
+def _highscore_pairs(fields):
+    """All (score, initials) pairs from one highscores export line.
+
+    fields is the semicolon-split line: gameId, name, createdAt,
+    then up to ten (initials, score) pairs starting at index 3
+    (initials1 at 3, score1 at 4, initials2 at 5, score2 at 6,
+    ... initials10 at 21, score10 at 22). Pairs whose score does
+    not parse are skipped; an empty initials field is kept as "".
+    Returns a list of (score:int, initials:str).
+    """
+    pairs = []
+    for k in range(10):
+        i_idx = 3 + 2 * k
+        s_idx = 4 + 2 * k
+        if s_idx >= len(fields):
+            break
+        try:
+            score = int(fields[s_idx].strip().replace(",", ""))
+        except ValueError:
+            continue
+        pairs.append((score, fields[i_idx].strip()))
+    return pairs
+
+
 def parse_highscores_plain(text, last_played=None):
     """Parse the cabinet's plain-text highscores export into a list.
 
@@ -271,6 +319,10 @@ def parse_highscores_plain(text, last_played=None):
     text is never changed by this fallback, only the sort order.
     Entries with neither a lastPlayed nor a modified date sort last.
     Without a map, entries keep the createdAt sort as a fallback.
+    Each entry also carries a private "_score_set" frozenset of all
+    (score, initials) pairs on its line, for track_last_scores to
+    compare against the previous fetch; the handler strips it via
+    track_last_scores before the entries are sent.
     Returns a list of
     {"gameId": int, "text": <gameDisplayName>, "score": <score1 int>,
     "playerInitials": <initials1>,
@@ -314,12 +366,66 @@ def parse_highscores_plain(text, last_played=None):
         entries.append({"gameId": game_id, "text": name, "score": score,
                         "playerInitials": fields[3].strip(),
                         "createdAt": created_at, "lastPlayed": lp_str,
-                        "_sort_key": sort_key})
+                        "_sort_key": sort_key,
+                        "_score_set": frozenset(_highscore_pairs(fields))})
     if not entries:
         return None
     entries.sort(key=lambda e: e["_sort_key"], reverse=True)
     for entry in entries:
         del entry["_sort_key"]
+    return entries
+
+
+def track_last_scores(entries):
+    """Detect newly appeared scores and attach lastScore to entries.
+
+    Compares each entry's full score list (the "_score_set"
+    frozenset attached by parse_highscores_plain) against the set
+    stored from the previous highscores fetch. On a table's first
+    appearance its current set is stored as the baseline and its
+    lastScore stays null, so no existing score is mislabeled as
+    the last score when the bridge starts (or restarts). On later
+    fetches, any (score, initials) pair not in the previous set is
+    a new score from a game just played; the newest detected one
+    is recorded as that table's lastScore, even when it is not the
+    top score. If several new pairs appear in one fetch (several
+    games between polls), the smallest new score is recorded, the
+    one inserted lowest in the ranking. Each entry gets "lastScore"
+    (int, or None), "lastScoreInitials" (str, "" when none) and
+    "lastScoreAt" (ISO detection time, "" when none); a lastScore
+    once detected persists across later unchanged fetches. The
+    "_score_set" scratch field is removed. State is in-memory only
+    and is lost when the bridge restarts.
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    with _SCORE_STATE_LOCK:
+        for entry in entries:
+            game_id = entry["gameId"]
+            current = entry.pop("_score_set", frozenset())
+            prev = _SCORE_BASELINE.get(game_id)
+            if prev is None:
+                # First sight of this table: baseline only, never
+                # label an existing score as the last score.
+                _SCORE_BASELINE[game_id] = set(current)
+            else:
+                new_pairs = current - prev
+                if new_pairs:
+                    # Newest detected score; smallest wins the tie
+                    # when several games landed between fetches.
+                    score, initials = min(new_pairs, key=lambda p: p[0])
+                    _LAST_SCORE[game_id] = {
+                        "score": score, "initials": initials,
+                        "detectedAt": now}
+                _SCORE_BASELINE[game_id] = set(current)
+            last = _LAST_SCORE.get(game_id)
+            if last is None:
+                entry["lastScore"] = None
+                entry["lastScoreInitials"] = ""
+                entry["lastScoreAt"] = ""
+            else:
+                entry["lastScore"] = last["score"]
+                entry["lastScoreInitials"] = last["initials"]
+                entry["lastScoreAt"] = last["detectedAt"]
     return entries
 
 class Handler(BaseHTTPRequestHandler):
@@ -429,6 +535,7 @@ class Handler(BaseHTTPRequestHandler):
                 entries = parse_highscores_plain(text, last_played)
                 if entries is None:
                     return self._send(200, {"ok": True, "raw": text})
+                track_last_scores(entries)
                 return self._send(200, {"ok": True, "highscores": entries})
             return self._send(404, {"ok": False, "error": "not found"})
         except Exception as e:
