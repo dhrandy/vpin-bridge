@@ -78,6 +78,7 @@ All endpoints, including `/health`, need the `X-Api-Key` header.
 | POST | `/api/details/<gameId>` | Save table details (JSON TableDetails). Not blocked by `DRY_RUN`. |
 | GET | `/api/validations/<gameId>` | Live validation for a table, current issue list (36 = BackGlass missing, 38 = PlayField missing) |
 | GET | `/api/reload/<gameId>` | Reload one table, use after uploading media so validation updates |
+| DELETE | `/api/games/<gameId>` | Delete a whole table. Only when you explicitly say to delete it. |
 | GET | `/api/playlists` | Playlists |
 | POST | `/api/playlists/<playlistId>/<gameId>` | Add a table to a playlist. Not blocked by `DRY_RUN`. |
 | POST | `/api/upload` | Multipart table archive (`.zip` / `.7z` / `.vpa`), fields `mode`, `gameId`, `emuId`, `objectId`, `assetType`. Forwards to the cabinet upload, then runs `/games/process`. Blocked by `DRY_RUN` and while a game is playing. |
