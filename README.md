@@ -83,6 +83,7 @@ All endpoints, including `/health`, need the `X-Api-Key` header.
 | POST | `/api/upload` | Multipart table archive (`.zip` / `.7z` / `.vpa`), fields `mode`, `gameId`, `emuId`, `objectId`, `assetType`. Forwards to the cabinet upload, then runs `/games/process`. Blocked by `DRY_RUN` and while a game is playing. |
 | POST | `/api/backglass` | Multipart `.directb2s` file |
 | POST | `/api/puppack` | Multipart PuP pack archive |
+| POST | `/api/rom?gameId=<id>` | Multipart ROM zip, e.g. gldneye.zip. Blocked by DRY_RUN. |
 | POST | `/api/media?screen=<SCREEN>&append=false` | Multipart media file for one screen. Screen names are case-sensitive enum names: `Wheel`, `PlayField`, `BackGlass`, `GameInfo`, `GameHelp`, `Topper`, `DMD`, `Loading`, `Menu`, `Other2`, `Logo`, `Audio`. All-caps screen names (for example `WHEEL`) are rejected by the cabinet with HTTP 400. |
 
 ## Table import checklist
