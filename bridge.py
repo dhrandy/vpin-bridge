@@ -23,7 +23,11 @@ Endpoints (all under /api, except /health):
     List tables, from cabinet GET /api/v1/export/tables/plain
     (fallback: GET /api/v1/games)
   GET  /api/status
-    Cabinet GET /api/v1/gamestatus, active when gameId > 0
+    Cabinet GET /api/v1/gamestatus, active when gameId > 0.
+    Adds a "text" field with the current table's display name,
+    resolved from the games export, so the dashboard can show a
+    live "now playing" banner. When no game is active, "text" is
+    "" and "active" is false.
   GET  /api/games/json
     List tables as JSON, from cabinet GET /api/v1/games
     (id + gameDisplayName, for picking a table to play)
@@ -36,8 +40,10 @@ Endpoints (all under /api, except /health):
     export (cabinet GET /api/v1/export/tables/plain), and entries
     are sorted by lastPlayed descending, most recently played
     first, so the first entry is the table last played. Tables
-    with no lastPlayed sort last. Optional gameId filters to
-    one table.
+    with no lastPlayed fall back to their "modified" date from the
+    games export for sorting, so a played table does not sink to
+    the bottom just because lastPlayed is blank; tables with
+    neither date sort last. Optional gameId filters to one table.
   POST /api/play
     JSON {"gameId": <int>}. Launches a table via the frontend,
     cabinet GET /api/v1/frontend/launch/<gameId>.
@@ -162,12 +168,16 @@ def _parse_play_date(s):
 
 
 def parse_last_played_map(text):
-    """Parse the cabinet's games export into a gameId -> lastPlayed map.
+    """Parse the cabinet's games export into a gameId -> dates map.
 
     The games export is semicolon-delimited CSV, one table per line,
-    with a header row that includes `id` and `lastPlayed` columns.
-    Returns a dict {gameId: (lastPlayed string as-is, parsed datetime)}.
+    with a header row that includes `id`, `lastPlayed` and `modified`
+    columns. Returns a dict
+    {gameId: (lastPlayed string as-is, parsed lastPlayed datetime,
+    parsed modified datetime)}.
     The lastPlayed string is "" when the table has never been played.
+    The modified datetime is datetime.min when the header has no
+    `modified` column or the value is empty/unparseable.
     Returns an empty dict if the header has no id/lastPlayed columns
     or no rows parse, so the caller can fall back to the createdAt
     sort instead of failing.
@@ -181,17 +191,55 @@ def parse_last_played_map(text):
         return last_played
     id_idx = header.index("id")
     lp_idx = header.index("lastPlayed")
+    mod_idx = header.index("modified") if "modified" in header else None
+    max_idx = max(i for i in (id_idx, lp_idx, mod_idx) if i is not None)
     for line in lines[1:]:
         fields = line.rstrip("\r").split(";")
-        if len(fields) <= max(id_idx, lp_idx):
+        if len(fields) <= max_idx:
             continue
         try:
             game_id = int(fields[id_idx].strip())
         except ValueError:
             continue
         lp = fields[lp_idx].strip()
-        last_played[game_id] = (lp, _parse_play_date(lp))
+        mod_dt = datetime.min
+        if mod_idx is not None:
+            mod_dt = _parse_play_date(fields[mod_idx].strip())
+        last_played[game_id] = (lp, _parse_play_date(lp), mod_dt)
     return last_played
+
+
+def parse_game_names_map(text):
+    """Parse the cabinet's games export into a gameId -> display name map.
+
+    The games export is semicolon-delimited CSV, one table per line,
+    with a header row that includes `id` and `gameDisplayName`
+    columns. Returns a dict {gameId: <gameDisplayName string as-is>}.
+    Returns an empty dict if the header has no id/gameDisplayName
+    columns or no rows parse.
+    """
+    names = {}
+    lines = [l for l in text.splitlines() if l.strip()]
+    if not lines:
+        return names
+    header = lines[0].rstrip("\r").split(";")
+    if "id" not in header or "gameDisplayName" not in header:
+        return names
+    id_idx = header.index("id")
+    name_idx = header.index("gameDisplayName")
+    max_idx = max(id_idx, name_idx)
+    for line in lines[1:]:
+        fields = line.rstrip("\r").split(";")
+        if len(fields) <= max_idx:
+            continue
+        try:
+            game_id = int(fields[id_idx].strip())
+        except ValueError:
+            continue
+        name = fields[name_idx].strip()
+        if name:
+            names[game_id] = name
+    return names
 
 
 def parse_highscores_plain(text, last_played=None):
@@ -214,9 +262,16 @@ def parse_highscores_plain(text, last_played=None):
     last_played map (from parse_last_played_map, built from the
     games export) is given, each entry gets a "lastPlayed" field
     (string as-is, "" when never played) and entries are sorted by
-    lastPlayed descending, most recently played first; entries with
-    no lastPlayed sort last. Without a map, entries keep the
-    createdAt sort as a fallback. Returns a list of
+    lastPlayed descending, most recently played first. Some tables
+    have been played but carry an empty lastPlayed in the games
+    export (the cabinet does not always stamp it); for those, the
+    table's "modified" date from the games export is used as the
+    sort key instead, so a played table does not sink to the bottom
+    just because lastPlayed is blank. The displayed "lastPlayed"
+    text is never changed by this fallback, only the sort order.
+    Entries with neither a lastPlayed nor a modified date sort last.
+    Without a map, entries keep the createdAt sort as a fallback.
+    Returns a list of
     {"gameId": int, "text": <gameDisplayName>, "score": <score1 int>,
     "playerInitials": <initials1>,
     "createdAt": <createdAt string as-is>,
@@ -247,8 +302,12 @@ def parse_highscores_plain(text, last_played=None):
             continue
         created_at = fields[2].strip()
         if last_played:
-            lp_str, lp_dt = last_played.get(game_id, ("", datetime.min))
-            sort_key = lp_dt
+            lp_str, lp_dt, mod_dt = last_played.get(
+                game_id, ("", datetime.min, datetime.min))
+            # Prefer the real lastPlayed; fall back to the modified
+            # date when lastPlayed is blank (the cabinet does not
+            # always stamp it even for played tables).
+            sort_key = lp_dt if lp_dt != datetime.min else mod_dt
         else:
             lp_str = ""
             sort_key = _parse_play_date(created_at)
@@ -295,7 +354,31 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"ok": True, "cabinet_reachable": False,
                                             "error": str(e), "dry_run": DRY_RUN})
             if path == "/api/status":
-                return self._send(200, cabinet_get("/api/v1/gamestatus"))
+                status = cabinet_get("/api/v1/gamestatus")
+                # Add the current table's display name so the dashboard
+                # can show a live "now playing" banner. The name comes
+                # from the games export; when no game is active the
+                # text is "" and active is false, so the banner hides.
+                game_id = -1
+                try:
+                    game_id = int(status.get("gameId", -1))
+                except (TypeError, ValueError):
+                    game_id = -1
+                text = ""
+                if game_id > 0:
+                    try:
+                        games = cabinet_get("/api/v1/export/tables/plain")
+                        games_text = games.get("raw") if isinstance(games, dict) else None
+                        if games_text:
+                            text = parse_game_names_map(games_text).get(game_id, "")
+                    except Exception:
+                        text = ""
+                if isinstance(status, dict):
+                    status = dict(status)
+                    status["text"] = text
+                    if game_id <= 0:
+                        status["active"] = False
+                return self._send(200, status)
             if path == "/api/games/json":
                 return self._send(200, cabinet_get("/api/v1/games"))
             if path == "/api/playlists":
