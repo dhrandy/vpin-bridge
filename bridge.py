@@ -58,6 +58,13 @@ Endpoints (all under /api, except /health):
     NOT blocked by DRY_RUN.
   GET  /api/playlists
     Cabinet GET /api/v1/playlists
+  GET  /api/validations/<gameId>
+    Live validation for a table, cabinet GET /api/v1/games/validations/<id>.
+    Returns the current issue list, for example code 36 means the
+    BackGlass image is missing, code 38 means the PlayField is missing.
+  GET  /api/reload/<gameId>
+    Reload one table, cabinet GET /api/v1/games/reload/<id>. Use after
+    uploading media, so the validation list updates.
   POST /api/playlists/<playlistId>/<gameId>
     Add a table to a playlist, cabinet PUT /api/v1/playlists/<id>/<gameId>/0.
     NOT blocked by DRY_RUN. Use for the Home playlist, so a table is visible.
@@ -157,6 +164,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/playlists":
                 return self._send(200, cabinet_get("/api/v1/playlists"))
             parts = [p for p in path.split("/") if p]
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "validations":
+                return self._send(200, cabinet_get(f"/api/v1/games/validations/{parts[2]}"))
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "reload":
+                return self._send(200, cabinet_get(f"/api/v1/games/reload/{parts[2]}"))
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "media":
                 try:
                     return self._send(200, cabinet_get(f"/api/v1/frontend/media/{parts[2]}"))
