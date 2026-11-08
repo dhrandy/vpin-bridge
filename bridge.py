@@ -141,26 +141,44 @@ def cabinet_put_json(path, payload):
 def parse_highscores_plain(text):
     """Parse the cabinet's plain-text highscores export into a list.
 
-    Each non-empty line is one high score entry. Returns a list of
-    {"text": <line>, "score": <int or None>} dicts, or None if no
-    line looks like a score entry, so the caller can fall back to
-    returning the raw text.
+    The export is semicolon-delimited CSV, one table per line, with
+    a header row:
+        gameId;gameDisplayName;createdAt;playerInitials1;score1;
+        playerInitials2;score2;...;playerInitials10;score10;
+    Example data line:
+        1;Leprechaun King;Nov 8, 2026, 5:08:08 PM;SCO;1,300,000;
+        TTY;1,200,000;WIC;1,100,000;NM1;1,000,000;...
+
+    The header line (starting with "gameId;") is skipped. For each
+    data line the top score is score1 (field 4), with the top
+    player's initials in field 3. Returns a list of
+    {"gameId": int, "text": <gameDisplayName>, "score": <score1 int>,
+    "playerInitials": <initials1>} dicts, or None if no data line
+    parses, so the caller can fall back to returning the raw text.
     """
     entries = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
-        nums = re.findall(r"[\d,]+", line)
-        score = None
-        if nums:
-            try:
-                score = int(nums[-1].replace(",", ""))
-            except ValueError:
-                score = None
-        if score is None:
+        if line.startswith("gameId;"):
             continue
-        entries.append({"text": line, "score": score})
+        fields = line.split(";")
+        if len(fields) < 5:
+            continue
+        try:
+            game_id = int(fields[0].strip())
+        except ValueError:
+            continue
+        name = fields[1].strip()
+        if not name:
+            continue
+        try:
+            score = int(fields[4].strip().replace(",", ""))
+        except ValueError:
+            continue
+        entries.append({"gameId": game_id, "text": name, "score": score,
+                        "playerInitials": fields[3].strip()})
     return entries if entries else None
 
 class Handler(BaseHTTPRequestHandler):
