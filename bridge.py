@@ -90,6 +90,7 @@ import re
 import sys
 import urllib.request
 import urllib.error
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -151,10 +152,16 @@ def parse_highscores_plain(text):
 
     The header line (starting with "gameId;") is skipped. For each
     data line the top score is score1 (field 4), with the top
-    player's initials in field 3. Returns a list of
+    player's initials in field 3. The createdAt field (field 2) is
+    when that table's top high score was recorded, the best available
+    proxy for when the table was last played. Entries are sorted by
+    createdAt descending, most recently played first; entries whose
+    createdAt cannot be parsed sort last. Returns a list of
     {"gameId": int, "text": <gameDisplayName>, "score": <score1 int>,
-    "playerInitials": <initials1>} dicts, or None if no data line
-    parses, so the caller can fall back to returning the raw text.
+    "playerInitials": <initials1>,
+    "createdAt": <createdAt string as-is>} dicts, or None if no data
+    line parses, so the caller can fall back to returning the raw
+    text.
     """
     entries = []
     for line in text.splitlines():
@@ -177,9 +184,20 @@ def parse_highscores_plain(text):
             score = int(fields[4].strip().replace(",", ""))
         except ValueError:
             continue
+        created_at = fields[2].strip()
+        try:
+            parsed = datetime.strptime(created_at, "%b %d, %Y, %I:%M:%S %p")
+        except ValueError:
+            parsed = datetime.min
         entries.append({"gameId": game_id, "text": name, "score": score,
-                        "playerInitials": fields[3].strip()})
-    return entries if entries else None
+                        "playerInitials": fields[3].strip(),
+                        "createdAt": created_at, "_sort_key": parsed})
+    if not entries:
+        return None
+    entries.sort(key=lambda e: e["_sort_key"], reverse=True)
+    for entry in entries:
+        del entry["_sort_key"]
+    return entries
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
