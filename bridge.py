@@ -85,6 +85,10 @@ Endpoints (all under /api, except /health):
     Other2, Logo, Audio. Default screen is PlayField.
   GET  /api/media/<gameId>
     Frontend media for a table, cabinet GET /api/v1/frontend/media/<id>
+  GET  /api/thumb/<gameId>
+    Playfield picture for a table: streams the cabinet's
+    GET /api/v1/media/<id>/PlayField?preview=true, which returns
+    the image, or a PNG frame when the PlayField media is a video.
   GET  /api/details/<gameId>
     Table details / metadata, cabinet GET /api/v1/frontend/tabledetails/<id>
   POST /api/details/<gameId>
@@ -152,6 +156,13 @@ def cabinet_get(path):
             return json.loads(body.decode("utf-8"))
         except Exception:
             return {"raw": body.decode("utf-8", "replace")}
+
+def cabinet_get_bytes(path, timeout=60):
+    """Raw passthrough for cabinet endpoints that return files
+    instead of JSON. Returns (content_type, body_bytes)."""
+    req = urllib.request.Request(cabinet_base() + path, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.headers.get("Content-Type", "application/octet-stream"), resp.read()
 
 def cabinet_post_json(path, payload):
     data = json.dumps(payload).encode("utf-8")
@@ -525,6 +536,21 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, cabinet_get(f"/api/v1/frontend/media/{parts[2]}"))
                 except Exception:
                     return self._send(200, cabinet_get(f"/api/v1/media/{parts[2]}"))
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "thumb":
+                # Playfield picture for a table. VPin Studio serves the
+                # media bytes itself and extracts a PNG frame when the
+                # PlayField media is a video (preview=true), so no file
+                # access on the cabinet is needed.
+                try:
+                    ctype, body = cabinet_get_bytes(f"/api/v1/media/{parts[2]}/PlayField?preview=true")
+                except urllib.error.HTTPError as e:
+                    return self._send(e.code, {"ok": False, "error": f"cabinet HTTP {e.code}"})
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "details":
                 return self._send(200, cabinet_get(f"/api/v1/frontend/tabledetails/{parts[2]}"))
             if path == "/api/games":
