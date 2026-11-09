@@ -89,6 +89,9 @@ Endpoints (all under /api, except /health):
     Playfield picture for a table: streams the cabinet's
     GET /api/v1/media/<id>/PlayField?preview=true, which returns
     the image, or a PNG frame when the PlayField media is a video.
+  GET  /api/scorehistory/<gameId>
+    Read-only passthrough to cabinet GET /api/v1/games/scorehistory/<id>.
+    Timestamped highscore-list snapshots, not a per-play results log.
   GET  /api/details/<gameId>
     Table details / metadata, cabinet GET /api/v1/frontend/tabledetails/<id>
   POST /api/details/<gameId>
@@ -551,6 +554,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "scorehistory":
+                try:
+                    game_id = int(parts[2])
+                    if game_id <= 0:
+                        raise ValueError()
+                except ValueError:
+                    return self._send(400, {"ok": False, "error": "bad table id"})
+                try:
+                    return self._send(200, cabinet_get(f"/api/v1/games/scorehistory/{game_id}"))
+                except urllib.error.HTTPError as e:
+                    return self._send(e.code, {"ok": False, "error": f"cabinet HTTP {e.code}"})
+                except Exception:
+                    return self._send(502, {"ok": False, "error": "score history unavailable"})
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "details":
                 return self._send(200, cabinet_get(f"/api/v1/frontend/tabledetails/{parts[2]}"))
             if path == "/api/games":
