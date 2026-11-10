@@ -15,6 +15,10 @@ The bridge runs on your own server (Docker Compose, Dockhand /
 CasaOS) and forwards to the cabinet's VPin Studio Server on the
 local network. The cabinet itself is never exposed to the internet.
 
+## Why a separate bridge?
+
+[vpin-dashboard](https://github.com/dhrandy/vpin-dashboard) provides the library, stats, accounts and browser interface. This bridge provides a small API authenticated by an API key that the dashboard and authorized agents or scripts can use independently. They can read table information without running on the cabinet or accessing its filesystem directly. The bridge runs on a Docker host on your private network and talks to VPin Studio Server on the cabinet. VPin Studio handles cabinet-local files and media.
+
 ## How it works
 
 ```
