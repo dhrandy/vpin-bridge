@@ -112,6 +112,7 @@ real import. DRY_RUN=true (default in compose) refuses all uploads.
 """
 import json
 import hmac
+import ipaddress
 import os
 import re
 import sys
@@ -137,6 +138,16 @@ PORT = int(os.environ.get("BRIDGE_PORT", "8080"))
 CABINET_IP = os.environ.get("CABINET_IP", "")
 VPIN_PORT = os.environ.get("VPIN_PORT", "8089")
 API_KEY = os.environ.get("API_KEY", "")
+# Wrong-key lockout. Valid keys are never throttled or delayed; only a
+# presented key that does not match counts, so scans and health checks are
+# unaffected. X-Forwarded-For is trusted only when the direct peer is a
+# configured reverse proxy, so clients cannot spoof their identity.
+AUTH_MAX_ATTEMPTS = int(os.environ.get("BRIDGE_AUTH_MAX_ATTEMPTS", "5"))
+AUTH_WINDOW_SECONDS = int(os.environ.get("BRIDGE_AUTH_WINDOW_SECONDS", "900"))
+TRUSTED_PROXIES = [ipaddress.ip_network(x.strip(), strict=False)
+                   for x in os.environ.get("BRIDGE_TRUSTED_PROXIES", "").split(",") if x.strip()]
+_AUTH_FAILURES = {}
+_AUTH_FAILURES_LOCK = threading.Lock()
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() in ("true", "1", "yes")
 
 # Last-score tracking state (in-memory only, lost on bridge restart).
@@ -492,6 +503,50 @@ def valid_id(value, allow_zero=False):
     return isinstance(value,str) and re.fullmatch(r'[0-9]{1,10}',value) is not None and (0 if allow_zero else 1) <= int(value) <= 2147483647
 
 
+def client_ip(handler):
+    peer = (getattr(handler, 'client_address', None) or ('', 0))[0]
+    try:
+        peer_ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return peer
+    if not any(peer_ip in net for net in TRUSTED_PROXIES):
+        return peer
+    chain = [x.strip() for x in handler.headers.get("X-Forwarded-For", "").split(",") if x.strip()]
+    for candidate in reversed(chain):
+        try:
+            hop = ipaddress.ip_address(candidate)
+        except ValueError:
+            break
+        if any(hop in net for net in TRUSTED_PROXIES):
+            continue
+        return candidate
+    return peer
+
+
+def auth_throttled(ip):
+    now = datetime.now().timestamp()
+    with _AUTH_FAILURES_LOCK:
+        count, until = _AUTH_FAILURES.get(ip, (0, 0))
+        return (count >= AUTH_MAX_ATTEMPTS and now < until), max(0, int(until - now))
+
+
+def record_auth_failure(ip):
+    global _AUTH_FAILURES
+    now = datetime.now().timestamp()
+    with _AUTH_FAILURES_LOCK:
+        if len(_AUTH_FAILURES) > 10000:
+            _AUTH_FAILURES = {k: v for k, v in _AUTH_FAILURES.items() if v[1] > now}
+        count, until = _AUTH_FAILURES.get(ip, (0, 0))
+        if now >= until:
+            count, until = 0, now + AUTH_WINDOW_SECONDS
+        _AUTH_FAILURES[ip] = (count + 1, until)
+
+
+def clear_auth_failures(ip):
+    with _AUTH_FAILURES_LOCK:
+        _AUTH_FAILURES.pop(ip, None)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "vpin-bridge"
     sys_version = ""
@@ -511,9 +566,20 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _auth(self):
-        if not API_KEY:
-            return False
-        return hmac.compare_digest(self.headers.get("X-Api-Key", "").encode(), API_KEY.encode())
+        # True when authorized. Sends the 401 or 429 reply itself otherwise.
+        # A valid key always passes immediately, even during a lockout.
+        if API_KEY and hmac.compare_digest(self.headers.get("X-Api-Key", "").encode(), API_KEY.encode()):
+            clear_auth_failures(client_ip(self))
+            return True
+        if API_KEY and self.headers.get("X-Api-Key"):
+            ip = client_ip(self)
+            limited, retry_after = auth_throttled(ip)
+            if limited:
+                self._send(429, {"ok": False, "error": "Too many failed attempts. Try again later.", "retryAfterSeconds": retry_after})
+                return False
+            record_auth_failure(ip)
+        self._send(401, {"ok": False, "error": "unauthorized"})
+        return False
 
     def _send(self, code, obj):
         data = json.dumps(obj).encode("utf-8")
@@ -525,7 +591,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if not self._auth():
-            return self._send(401, {"ok": False, "error": "unauthorized"})
+            return
         path = urlparse(self.path).path
         try:
             if path == "/health":
@@ -720,7 +786,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self._auth():
-            return self._send(401, {"ok": False, "error": "unauthorized"})
+            return
         path = urlparse(self.path).path
         query = parse_qs(urlparse(self.path).query)
         if self.headers.get("Transfer-Encoding"):

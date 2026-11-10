@@ -54,6 +54,14 @@ assistant / script
      in Dockhand Environment. Never put it in this repo, in code,
      or in a README.
    - `API_KEY` - a long random API key of your choosing.
+   Optional, with defaults that suit most setups:
+   - `BRIDGE_AUTH_MAX_ATTEMPTS` (5) - presented-but-wrong keys from one
+     address before it is locked out. A valid key always passes and
+     resets the count, so normal scanning is never delayed.
+   - `BRIDGE_AUTH_WINDOW_SECONDS` (900) - how long a lockout lasts.
+   - `BRIDGE_TRUSTED_PROXIES` (empty) - comma-separated CIDRs of reverse
+     proxies whose `X-Forwarded-For` header may be trusted for client
+     addresses. Empty means the header is always ignored.
    The supplied compose sets `DRY_RUN=true` directly. While true,
    table/ROM uploads are refused, but Play, metadata and playlist
    changes are not blocked. Change that compose entry to false only
