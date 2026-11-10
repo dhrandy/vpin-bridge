@@ -26,16 +26,16 @@ class Tests(unittest.TestCase):
   global value
   for value in [[],None,{}, {'entries':None}]:self.assertEqual(get()[0],502)
  def test_06_upstream_byte_limit(self):
-  oldopen=b.urllib.request.urlopen;oldbase=b.cabinet_base
+  oldopen=b.upstream_open;oldbase=b.cabinet_base
   class Response:
    def __enter__(self):return self
    def __exit__(self,*args):pass
    def read(self,n=-1):return b'x'*n
   try:
    b.cabinet_base=lambda:'http://127.0.0.1'
-   b.urllib.request.urlopen=lambda request,timeout:Response()
+   b.upstream_open=lambda request,timeout:Response()
    with self.assertRaises(ValueError):real_cabinet_get('/api/v1/alx',max_bytes=10)
-  finally:b.urllib.request.urlopen=oldopen;b.cabinet_base=oldbase
+  finally:b.upstream_open=oldopen;b.cabinet_base=oldbase
 def tearDownModule():
  server.shutdown();server.server_close()
 

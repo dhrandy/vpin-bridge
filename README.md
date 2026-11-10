@@ -158,7 +158,7 @@ AI was used in development, with extensive automated testing. Testing is not a g
 
 ## Tests
 
-Run `python -m unittest discover -s tests -v` for the synthetic analytics endpoint tests. They use a local fixture server and do not contact a cabinet.
+Run `python -m unittest discover -s tests -v` for the synthetic analytics, hostile-request, Exit and upstream-boundary regression tests. They use a local fixture server and do not contact a cabinet.
 
 ## Exit table / frontend
 
@@ -175,3 +175,7 @@ Keep this API private. Every route requires the shared API key; there is no brow
 ## License
 
 Copyright dhrandy. All rights reserved. No license is granted.
+
+### Upstream request boundary
+
+The bridge does not follow redirects from VPin Studio. A configured endpoint must answer directly; redirect failures are not retried. JSON responses from reads, writes and uploads are limited to 16 MiB, and image responses to 32 MiB. Error replies use generic messages instead of forwarding upstream exception text or error bodies that could contain private addresses or paths. Normal authenticated API results still contain the table information the endpoint is designed to return; this is not a blanket redaction service. An uncertain launch, exit or import result still needs checking before retrying.

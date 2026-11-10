@@ -122,6 +122,17 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        # A configured service must not forward credentials or actions elsewhere.
+        return None
+
+_UPSTREAM = urllib.request.build_opener(_NoRedirect())
+
+def upstream_open(request, timeout):
+    return _UPSTREAM.open(request, timeout=timeout)
+
+
 PORT = int(os.environ.get("BRIDGE_PORT", "8080"))
 CABINET_IP = os.environ.get("CABINET_IP", "")
 VPIN_PORT = os.environ.get("VPIN_PORT", "8089")
@@ -145,6 +156,14 @@ _SCORE_STATE_LOCK = threading.Lock()
 _SCORE_BASELINE = {}
 _LAST_SCORE = {}
 
+MAX_JSON_RESPONSE = 16 * 1024 * 1024
+
+def bounded_response(response, limit=MAX_JSON_RESPONSE):
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise ValueError("Cabinet response exceeds byte limit")
+    return body
+
 def cabinet_base():
     if not CABINET_IP:
         raise RuntimeError("CABINET_IP is not set in Dockhand Environment")
@@ -152,10 +171,8 @@ def cabinet_base():
 
 def cabinet_get(path, max_bytes=16*1024*1024):
     req = urllib.request.Request(cabinet_base() + path, method="GET")
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        body = resp.read(max_bytes + 1) if max_bytes is not None else resp.read()
-        if max_bytes is not None and len(body) > max_bytes:
-            raise ValueError("Cabinet response exceeds byte limit")
+    with upstream_open(req, timeout=15) as resp:
+        body = bounded_response(resp, max_bytes)
         try:
             return json.loads(body.decode("utf-8"))
         except Exception:
@@ -165,7 +182,7 @@ def cabinet_get_bytes(path, timeout=60):
     """Raw passthrough for cabinet endpoints that return files
     instead of JSON. Returns (content_type, body_bytes)."""
     req = urllib.request.Request(cabinet_base() + path, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with upstream_open(req, timeout=timeout) as resp:
         body=resp.read(32*1024*1024+1)
         if len(body)>32*1024*1024:raise ValueError("Image exceeds byte limit")
         return resp.headers.get("Content-Type", "application/octet-stream"),body
@@ -175,8 +192,8 @@ def cabinet_post_json(path, payload):
     req = urllib.request.Request(cabinet_base() + path, data=data,
                                  headers={"Content-Type": "application/json"},
                                  method="POST")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        body = resp.read()
+    with upstream_open(req, timeout=60) as resp:
+        body = bounded_response(resp)
         try:
             return json.loads(body.decode("utf-8"))
         except Exception:
@@ -187,8 +204,8 @@ def cabinet_put_json(path, payload):
     req = urllib.request.Request(cabinet_base() + path, data=data,
                                  headers={"Content-Type": "application/json"},
                                  method="PUT")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        body = resp.read()
+    with upstream_open(req, timeout=60) as resp:
+        body = bounded_response(resp)
         try:
             return json.loads(body.decode("utf-8"))
         except Exception:
@@ -519,7 +536,7 @@ class Handler(BaseHTTPRequestHandler):
                                             "game_playing": playing, "dry_run": DRY_RUN})
                 except Exception as e:
                     return self._send(200, {"ok": True, "cabinet_reachable": False,
-                                            "error": str(e), "dry_run": DRY_RUN})
+                                            "error": "Cabinet request unavailable", "dry_run": DRY_RUN})
             if path == "/api/status":
                 status = cabinet_get("/api/v1/gamestatus")
                 # Add the current table's display name so the dashboard
@@ -624,7 +641,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     result = cabinet_get(cabinet_path)
                 except Exception as e:
-                    return self._send(502, {"ok": False, "error": str(e)})
+                    return self._send(502, {"ok": False, "error": "Cabinet request unavailable"})
                 text = result.get("raw") if isinstance(result, dict) else None
                 if text is None:
                     return self._send(200, {"ok": True, "highscores": result})
@@ -648,7 +665,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "highscores": entries})
             return self._send(404, {"ok": False, "error": "not found"})
         except Exception as e:
-            return self._send(500, {"ok": False, "error": str(e)})
+            return self._send(500, {"ok": False, "error": "Cabinet request unavailable"})
 
     def _cabinet_control(self, path):
         if not _CONTROL_LOCK.acquire(blocking=False):
@@ -739,13 +756,13 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError,UnicodeError):
                 return self._send(400,{"ok":False,"error":"Valid JSON object required"})
             except Exception as e:
-                return self._send(502, {"ok": False, "error": str(e)})
+                return self._send(502, {"ok": False, "error": "Cabinet request unavailable"})
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "playlists":
             try:
                 result = cabinet_put_json(f"/api/v1/playlists/{parts[2]}/{parts[3]}/0", {})
                 return self._send(200, {"ok": True, "result": result})
             except Exception as e:
-                return self._send(502, {"ok": False, "error": str(e)})
+                return self._send(502, {"ok": False, "error": "Cabinet request unavailable"})
         if path not in ('/api/upload','/api/backglass','/api/puppack','/api/media','/api/rom'):
             return self._send(404,{"ok":False,"error":"not found"})
         if path=='/api/rom' and not valid_id(query.get('gameId',[''])[0]):
@@ -769,7 +786,7 @@ class Handler(BaseHTTPRequestHandler):
             if status["gameId"] > 0:
                 return self._send(409, {"ok": False, "error": "a game is playing, import refused"})
         except Exception as e:
-            return self._send(502, {"ok": False, "error": f"cabinet unreachable: {e}"})
+            return self._send(502, {"ok": False, "error": "Cabinet unavailable; no upload sent"})
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         content_type = self.headers.get("Content-Type", "")
@@ -786,19 +803,19 @@ class Handler(BaseHTTPRequestHandler):
                 req = urllib.request.Request(
                     cabinet_base() + targets[path], data=body,
                     headers={"Content-Type": content_type}, method="POST")
-                with urllib.request.urlopen(req, timeout=300) as resp:
-                    result = json.loads(resp.read().decode("utf-8"))
+                with upstream_open(req, timeout=300) as resp:
+                    result = json.loads(bounded_response(resp).decode("utf-8"))
             except urllib.error.HTTPError as e:
-                return self._send(e.code, {"ok": False, "error": e.read().decode("utf-8", "replace")[:500]})
+                return self._send(e.code, {"ok": False, "error": "Cabinet rejected the upload"})
             except Exception as e:
-                return self._send(502, {"ok": False, "error": str(e)})
+                return self._send(502, {"ok": False, "error": "Cabinet request unavailable"})
             if path == "/api/upload":
                 # Second step: process the upload descriptor.
                 try:
                     processed = cabinet_post_json("/api/v1/games/process", result)
                     return self._send(200, {"ok": True, "upload": result, "processed": processed})
                 except Exception as e:
-                    return self._send(200, {"ok": True, "upload": result, "processed_error": str(e)})
+                    return self._send(200, {"ok": True, "upload": result, "processed_error": "Processing outcome unknown; check cabinet before retrying"})
             return self._send(200, {"ok": True, "result": result})
         if path == "/api/media":
             screen = query.get("screen", ["PlayField"])[0]
@@ -807,11 +824,11 @@ class Handler(BaseHTTPRequestHandler):
                 req = urllib.request.Request(
                     cabinet_base() + f"/api/v1/media/upload/{screen}/{append}",
                     data=body, headers={"Content-Type": content_type}, method="POST")
-                with urllib.request.urlopen(req, timeout=300) as resp:
-                    result = json.loads(resp.read().decode("utf-8"))
+                with upstream_open(req, timeout=300) as resp:
+                    result = json.loads(bounded_response(resp).decode("utf-8"))
                 return self._send(200, {"ok": True, "result": result})
             except Exception as e:
-                return self._send(502, {"ok": False, "error": str(e)})
+                return self._send(502, {"ok": False, "error": "Cabinet request unavailable"})
         if path == "/api/rom":
             game_id = query.get("gameId", [None])[0]
             if not game_id:
@@ -820,13 +837,13 @@ class Handler(BaseHTTPRequestHandler):
                 req = urllib.request.Request(
                     cabinet_base() + f"/api/v1/assets/{game_id}/upload/0?assetType=ROM",
                     data=body, headers={"Content-Type": content_type}, method="POST")
-                with urllib.request.urlopen(req, timeout=300) as resp:
-                    result = json.loads(resp.read().decode("utf-8"))
+                with upstream_open(req, timeout=300) as resp:
+                    result = json.loads(bounded_response(resp).decode("utf-8"))
                 return self._send(200, {"ok": True, "result": result})
             except urllib.error.HTTPError as e:
-                return self._send(e.code, {"ok": False, "error": e.read().decode("utf-8", "replace")[:500]})
+                return self._send(e.code, {"ok": False, "error": "Cabinet rejected the upload"})
             except Exception as e:
-                return self._send(502, {"ok": False, "error": str(e)})
+                return self._send(502, {"ok": False, "error": "Cabinet request unavailable"})
         return self._send(404, {"ok": False, "error": "not found"})
 
 class LimitedServer(ThreadingHTTPServer):
