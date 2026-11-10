@@ -17,7 +17,15 @@ local network. The cabinet itself is never exposed to the internet.
 
 ## Why a separate bridge?
 
-[vpin-dashboard](https://github.com/dhrandy/vpin-dashboard) provides the library, stats, accounts and browser interface. This bridge provides a small API authenticated by an API key that the dashboard and authorized agents or scripts can use independently. They can read table information without running on the cabinet or accessing its filesystem directly. The bridge runs on a Docker host on your private network and talks to VPin Studio Server on the cabinet. VPin Studio handles cabinet-local files and media.
+The dashboard never talks to the cabinet directly. This bridge runs in Docker on your own server, holds the cabinet address and the API key, and forwards requests to VPin Studio Server on the cabinet. That split gives you:
+
+- **A private cabinet.** The cabinet is a Windows PC on your home network. Only the bridge knows its address, and VPin Studio's port never leaves the local network.
+- **One place for the key.** The API key lives only in this container's environment. The dashboard and any agents or scripts authenticate to the bridge; the cabinet itself needs no accounts exposed.
+- **A guard at the door.** Every request is validated before it reaches the cabinet. Presented-but-wrong keys are locked out for a window (`BRIDGE_AUTH_MAX_ATTEMPTS`, `BRIDGE_AUTH_WINDOW_SECONDS`), while a valid key always passes without delay. If you front the bridge with a reverse proxy, set `BRIDGE_TRUSTED_PROXIES` to the proxy's addresses so lockouts count real clients instead of the proxy.
+- **A dashboard you can expose safely.** The dashboard holds only its own accounts and settings, so it can sit behind your proxy for phone access without giving browsers anything that talks to the cabinet.
+- **Independent updates.** The bridge is one file pulled from this repo on container start. The dashboard is a separate stack. Update either side without redeploying the other.
+
+[vpin-dashboard](https://github.com/dhrandy/vpin-dashboard) provides the library, stats, accounts and browser interface. VPin Studio on the cabinet handles cabinet-local files and media.
 
 ## How it works
 
