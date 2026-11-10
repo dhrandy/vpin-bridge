@@ -154,7 +154,7 @@ Studio treats a missing backglass/PUP warning as neither backglass nor installed
 
 ## AI usage
 
-AI-assisted development was used for this project. The maintainer reviews and decides what ships. Automated tests are not an independent security audit. Do not include keys, cabinet addresses, local paths or private table data in public bug reports.
+AI was used in development, with extensive automated testing. Testing is not a guarantee that every setup or edge case will work. The maintainer reviews and decides what ships. Automated tests are not an independent security audit. Do not include keys, cabinet addresses, local paths or private table data in public bug reports.
 
 ## Tests
 
