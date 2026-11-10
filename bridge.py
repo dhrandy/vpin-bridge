@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """
-VPin Bridge - Google TV style API bridge for a pinball cabinet.
+VPin Bridge - private API bridge for a pinball cabinet.
 
-Same access pattern as the Google TV bridge:
-- Local: http://<docker-host>:8744  (Docker, Dockhand compose, CasaOS)
-- Remote: https://<reverse-proxy-host>
-  (reverse proxy, same pattern as googletv-bridge)
-- Auth: X-Api-Key header, key set in Dockhand Environment as API_KEY,
-  and stored in Todd's secure storage as custom.vpin-bridge.
-  Todd never sees the raw key, the CLI carries it via surrogate.
-- Todd calls this bridge directly, no GitHub polling, no Tailscale.
-  The bridge forwards to the cabinet VPin Studio API on the LAN.
+- Local Docker service: http://<docker-host>:8744.
+- Keep the service private behind trusted routing.
+- Auth: X-Api-Key header, set with the API_KEY environment variable.
+- The bridge forwards requests to the VPin Studio API on the LAN.
 
 Cabinet: a Visual Pinball cabinet, VPin Studio Server port 8089, LAN only.
 Cabinet IP comes only from env var CABINET_IP, set in Dockhand.
@@ -116,6 +111,7 @@ pinned 5.6.1 tag, confirm on the cabinet version before first
 real import. DRY_RUN=true (default in compose) refuses all uploads.
 """
 import json
+import hmac
 import os
 import re
 import sys
@@ -142,6 +138,9 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").lower() in ("true", "1", "yes")
 # startup. Guarded by _SCORE_STATE_LOCK: the server is threaded
 # and two concurrent highscores fetches must not interleave a
 # compare-and-store.
+_UPLOAD_LOCK = threading.BoundedSemaphore(1)
+MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+_CONTROL_LOCK = threading.Lock()
 _SCORE_STATE_LOCK = threading.Lock()
 _SCORE_BASELINE = {}
 _LAST_SCORE = {}
@@ -151,7 +150,7 @@ def cabinet_base():
         raise RuntimeError("CABINET_IP is not set in Dockhand Environment")
     return f"http://{CABINET_IP}:{VPIN_PORT}"
 
-def cabinet_get(path, max_bytes=None):
+def cabinet_get(path, max_bytes=16*1024*1024):
     req = urllib.request.Request(cabinet_base() + path, method="GET")
     with urllib.request.urlopen(req, timeout=15) as resp:
         body = resp.read(max_bytes + 1) if max_bytes is not None else resp.read()
@@ -167,7 +166,9 @@ def cabinet_get_bytes(path, timeout=60):
     instead of JSON. Returns (content_type, body_bytes)."""
     req = urllib.request.Request(cabinet_base() + path, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.headers.get("Content-Type", "application/octet-stream"), resp.read()
+        body=resp.read(32*1024*1024+1)
+        if len(body)>32*1024*1024:raise ValueError("Image exceeds byte limit")
+        return resp.headers.get("Content-Type", "application/octet-stream"),body
 
 def cabinet_post_json(path, payload):
     data = json.dumps(payload).encode("utf-8")
@@ -470,14 +471,32 @@ def track_last_scores(entries):
                 entry["lastScoreAt"] = last["detectedAt"]
     return entries
 
+def valid_id(value, allow_zero=False):
+    return isinstance(value,str) and re.fullmatch(r'[0-9]{1,10}',value) is not None and (0 if allow_zero else 1) <= int(value) <= 2147483647
+
+
 class Handler(BaseHTTPRequestHandler):
+    server_version = "vpin-bridge"
+    sys_version = ""
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(15)
+
+    def end_headers(self):
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        super().end_headers()
+
     def log_message(self, *args):
         pass
 
     def _auth(self):
         if not API_KEY:
             return False
-        return self.headers.get("X-Api-Key") == API_KEY
+        return hmac.compare_digest(self.headers.get("X-Api-Key", "").encode(), API_KEY.encode())
 
     def _send(self, code, obj):
         data = json.dumps(obj).encode("utf-8")
@@ -547,6 +566,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/playlists":
                 return self._send(200, cabinet_get("/api/v1/playlists"))
             parts = [p for p in path.split("/") if p]
+            if len(parts)==3 and parts[0]=='api' and parts[1] in ('validations','reload','media','thumb','scorehistory','details') and not valid_id(parts[2]):
+                return self._send(400,{"ok":False,"error":"Valid table id required"})
+
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "validations":
                 return self._send(200, cabinet_get(f"/api/v1/games/validations/{parts[2]}"))
             if len(parts) == 3 and parts[0] == "api" and parts[1] == "reload":
@@ -595,6 +617,8 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(urlparse(self.path).query)
                 game_id = query.get("gameId", [None])[0]
                 cabinet_path = "/api/v1/export/highscores/plain"
+                if game_id is not None and not valid_id(game_id):
+                    return self._send(400,{"ok":False,"error":"Valid table id required"})
                 if game_id:
                     cabinet_path += f"?gameId={game_id}"
                 try:
@@ -626,40 +650,94 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send(500, {"ok": False, "error": str(e)})
 
+    def _cabinet_control(self, path):
+        if not _CONTROL_LOCK.acquire(blocking=False):
+            return self._send(409, {"ok": False, "error": "Another cabinet action is in progress"})
+        try:
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                if not 0 < length <= 4096:
+                    raise ValueError()
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                game_id = payload.get("gameId")
+                if type(game_id) is not int or not 0 < game_id <= 2147483647:
+                    raise ValueError()
+                if path == "/api/exit" and (set(payload) != {"gameId", "started"} or not isinstance(payload["started"], str)):
+                    raise ValueError()
+            except Exception:
+                return self._send(400, {"ok": False, "error": "Valid session or table identity required"})
+            try:
+                status = cabinet_get("/api/v1/gamestatus")
+                if not isinstance(status, dict) or type(status.get("gameId")) is not int:
+                    raise ValueError()
+            except Exception:
+                return self._send(502, {"ok": False, "error": "Cabinet status unavailable; no action sent"})
+            if path == "/api/play":
+                if status["gameId"] > 0:
+                    return self._send(409, {"ok": False, "error": "A game is already playing"})
+                try:
+                    launched = cabinet_get(f"/api/v1/frontend/launch/{game_id}")
+                    if launched is not True:
+                        return self._send(502, {"ok": False, "error": "Studio did not confirm the launch request"})
+                    return self._send(200, {"ok": True, "gameId": game_id, "launched": True})
+                except Exception:
+                    return self._send(502, {"ok": False, "error": "Launch outcome unknown; check cabinet before retrying"})
+            try:
+                observed = datetime.fromisoformat(str(status.get("started", "")).replace("Z", "+00:00"))
+                expected = datetime.fromisoformat(payload["started"].replace("Z", "+00:00"))
+                same_start = observed.utcoffset() is not None and expected.utcoffset() is not None and observed == expected
+            except (ValueError, TypeError):
+                same_start = False
+            if status["gameId"] != game_id or not same_start:
+                return self._send(409, {"ok": False, "error": "Reported session changed; no exit sent"})
+            try:
+                # This is a mutation despite Studio exposing it as GET. Never retry it.
+                accepted = cabinet_get("/api/v1/frontend/terminate")
+                if accepted is not True:
+                    return self._send(502, {"ok": False, "error": "Studio did not confirm the exit request; check cabinet"})
+                return self._send(200, {"ok": True, "exitRequested": True, "idleConfirmed": False})
+            except Exception:
+                return self._send(502, {"ok": False, "error": "Exit outcome unknown; check cabinet before retrying"})
+        finally:
+            _CONTROL_LOCK.release()
+
     def do_POST(self):
         if not self._auth():
             return self._send(401, {"ok": False, "error": "unauthorized"})
         path = urlparse(self.path).path
         query = parse_qs(urlparse(self.path).query)
-        # Play is not an upload, DRY_RUN does not block it.
-        if path == "/api/play":
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(length) if length else b"{}"
-                payload = json.loads(body.decode("utf-8") or "{}")
-                game_id = int(payload.get("gameId"))
-            except Exception as e:
-                return self._send(400, {"ok": False, "error": f"gameId required: {e}"})
-            try:
-                status = cabinet_get("/api/v1/gamestatus")
-                if int(status.get("gameId", -1)) > 0:
-                    return self._send(409, {"ok": False, "error": "a game is already playing"})
-            except Exception as e:
-                return self._send(502, {"ok": False, "error": f"cabinet unreachable: {e}"})
-            try:
-                launched = cabinet_get(f"/api/v1/frontend/launch/{game_id}")
-                return self._send(200, {"ok": True, "gameId": game_id, "launched": launched})
-            except Exception as e:
-                return self._send(502, {"ok": False, "error": str(e)})
+        if self.headers.get("Transfer-Encoding"):
+            return self._send(400,{"ok":False,"error":"Transfer encoding not supported"})
+        try:
+            length=int(self.headers.get("Content-Length","0"))
+        except ValueError:
+            return self._send(400,{"ok":False,"error":"Invalid request length"})
+        limit = MAX_UPLOAD_BYTES if path in ('/api/upload','/api/backglass','/api/puppack','/api/media','/api/rom') else 200000
+        if length<0 or length>limit:
+            return self._send(413,{"ok":False,"error":"Request body exceeds limit"})
+        if path in ('/api/play','/api/exit') or path.startswith('/api/details/'):
+            if self.headers.get('Content-Type','').split(';')[0].strip()!='application/json':
+                return self._send(415,{"ok":False,"error":"JSON content required"})
+        if path in ("/api/play", "/api/exit"):
+            return self._cabinet_control(path)
         # Details and playlist changes are not uploads, DRY_RUN does not block them.
         parts = [p for p in path.split("/") if p]
+        if len(parts)==3 and parts[:2]==['api','details'] and not valid_id(parts[2]):
+            return self._send(400,{"ok":False,"error":"Valid table id required"})
+        if len(parts)==4 and parts[:2]==['api','playlists'] and not (valid_id(parts[2],allow_zero=True) and valid_id(parts[3])):
+            return self._send(400,{"ok":False,"error":"Valid playlist and table ids required"})
+
         if len(parts) == 3 and parts[0] == "api" and parts[1] == "details":
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(length) if length else b"{}"
                 payload = json.loads(body.decode("utf-8") or "{}")
+                if not isinstance(payload,dict):
+                    raise ValueError("JSON object required")
                 result = cabinet_post_json(f"/api/v1/frontend/tabledetails/{parts[2]}", payload)
                 return self._send(200, {"ok": True, "result": result})
+            except (ValueError,UnicodeError):
+                return self._send(400,{"ok":False,"error":"Valid JSON object required"})
             except Exception as e:
                 return self._send(502, {"ok": False, "error": str(e)})
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "playlists":
@@ -668,18 +746,34 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "result": result})
             except Exception as e:
                 return self._send(502, {"ok": False, "error": str(e)})
+        if path not in ('/api/upload','/api/backglass','/api/puppack','/api/media','/api/rom'):
+            return self._send(404,{"ok":False,"error":"not found"})
+        if path=='/api/rom' and not valid_id(query.get('gameId',[''])[0]):
+            return self._send(400,{"ok":False,"error":"Valid table id required"})
+        if path=='/api/media' and (query.get('screen',['PlayField'])[0] not in ('PlayField','Wheel','BackGlass','GameInfo','GameHelp','Topper','DMD','Loading','Menu','Other2','Logo','Audio') or query.get('append',['false'])[0] not in ('true','false')):
+            return self._send(400,{"ok":False,"error":"Invalid media screen or append flag"})
+        if not _UPLOAD_LOCK.acquire(blocking=False):
+            return self._send(409,{"ok":False,"error":"Another upload is in progress"})
+        try:
+            return self._upload_request(path,query)
+        finally:
+            _UPLOAD_LOCK.release()
+
+    def _upload_request(self,path,query):
         if DRY_RUN:
             return self._send(403, {"ok": False, "error": "dry-run mode, uploads disabled. Set DRY_RUN=false in Dockhand to allow imports."})
         try:
             status = cabinet_get("/api/v1/gamestatus")
-            if int(status.get("gameId", -1)) > 0:
+            if not isinstance(status,dict) or type(status.get("gameId")) is not int:
+                return self._send(503,{"ok":False,"error":"Cabinet state unknown; import refused"})
+            if status["gameId"] > 0:
                 return self._send(409, {"ok": False, "error": "a game is playing, import refused"})
         except Exception as e:
             return self._send(502, {"ok": False, "error": f"cabinet unreachable: {e}"})
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         content_type = self.headers.get("Content-Type", "")
-        # Proxy the multipart body straight to the cabinet. Todd's CLI
+        # Proxy the multipart body straight to the cabinet. The upload client
         # already includes the required fields (mode, gameId, emuId,
         # objectId, assetType) in the multipart, the bridge just forwards.
         targets = {
@@ -735,6 +829,29 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(502, {"ok": False, "error": str(e)})
         return self._send(404, {"ok": False, "error": "not found"})
 
+class LimitedServer(ThreadingHTTPServer):
+    """Bound slow-client threads independently of the upload memory cap."""
+    daemon_threads = True
+    request_queue_size = 16
+    slots = threading.BoundedSemaphore(16)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            request.close()
+            return
+        try:
+            super().process_request(request,client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request,client_address)
+        finally:
+            self.slots.release()
+
+
 if __name__ == "__main__":
     if not API_KEY:
         print("vpin-bridge refusing to start: API_KEY is not set in Dockhand Environment", flush=True)
@@ -746,4 +863,4 @@ if __name__ == "__main__":
         except Exception:
             pass
     print(f"vpin-bridge listening on :{PORT}, dry_run={DRY_RUN}", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    LimitedServer(("0.0.0.0", PORT), Handler).serve_forever()

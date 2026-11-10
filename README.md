@@ -156,6 +156,18 @@ AI-assisted development was used for this project. The maintainer reviews and de
 
 Run `python -m unittest discover -s tests -v` for the synthetic analytics endpoint tests. They use a local fixture server and do not contact a cabinet.
 
+## Exit table / frontend
+
+`POST /api/exit` accepts a JSON `gameId` and ISO `started` timestamp matching the currently reported session. It requires the bridge API key. The dashboard adds admin role checks, CSRF protection and an explicit force-close confirmation.
+
+The bridge checks fresh game status, refuses a changed or unidentified session, and serializes Exit with Play. It calls Studio's side-effecting `GET /api/v1/frontend/terminate` exactly once. This can force-close the frontend and emulator and lose an unsaved game. It is not an upload, so DRY_RUN does not block it, just as DRY_RUN does not block Play. A successful response says `exitRequested: true, idleConfirmed: false`: Studio's return value is not proof every process exited. Timeouts are uncertain, never automatically retried. The dashboard must obtain fresh reported status before offering Play again. No Exit action is run by background collection or Sync.
+
+
+## Request limits
+
+Keep this API private. Every route requires the shared API key; there is no browser CORS grant. Keys are compared with a timing-safe comparison. Requests have a socket timeout and at most 16 concurrent request threads. Only one upload can be buffered at once, with a 512 MiB request limit; split or reduce larger archives before uploading. JSON writes are limited to 200,000 bytes (cabinet controls to 4 KiB), reject unsupported transfer encoding, and require JSON content. Table/playlist IDs and media enum parameters are validated before upstream calls. Unknown cabinet state refuses imports and Play. Read responses are bounded to 16 MiB JSON or 32 MiB image bytes. Responses are private/no-store and do not expose the Python version. These checks do not replace private routing, HTTPS at the proxy, backups or host security.
+
+
 ## License
 
 Copyright dhrandy. All rights reserved. No license is granted.
