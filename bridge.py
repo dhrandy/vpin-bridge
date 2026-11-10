@@ -151,10 +151,12 @@ def cabinet_base():
         raise RuntimeError("CABINET_IP is not set in Dockhand Environment")
     return f"http://{CABINET_IP}:{VPIN_PORT}"
 
-def cabinet_get(path):
+def cabinet_get(path, max_bytes=None):
     req = urllib.request.Request(cabinet_base() + path, method="GET")
     with urllib.request.urlopen(req, timeout=15) as resp:
-        body = resp.read()
+        body = resp.read(max_bytes + 1) if max_bytes is not None else resp.read()
+        if max_bytes is not None and len(body) > max_bytes:
+            raise ValueError("Cabinet response exceeds byte limit")
         try:
             return json.loads(body.decode("utf-8"))
         except Exception:
@@ -525,6 +527,21 @@ class Handler(BaseHTTPRequestHandler):
                     if game_id <= 0:
                         status["active"] = False
                 return self._send(200, status)
+            if path == "/api/analytics":
+                # Read-only bulk totals; never expose frontend paths or raw metadata.
+                summary = cabinet_get("/api/v1/alx", max_bytes=4 * 1024 * 1024)
+                if not isinstance(summary, dict) or not isinstance(summary.get("entries"), list):
+                    return self._send(502, {"ok": False, "error": "Analytics unavailable"})
+                if len(summary["entries"]) > 10000:
+                    return self._send(502, {"ok": False, "error": "Analytics exceeds row limit"})
+                entries = []
+                for entry in summary["entries"]:
+                    if not isinstance(entry, dict):
+                        continue
+                    game_id, seconds = entry.get("gameId"), entry.get("timePlayedSecs")
+                    if type(game_id) is int and 0 < game_id <= 2147483647 and type(seconds) is int and 0 <= seconds <= 2147483647:
+                        entries.append({"gameId": game_id, "timePlayedSecs": seconds})
+                return self._send(200, {"ok": True, "entries": entries})
             if path == "/api/games/json":
                 return self._send(200, cabinet_get("/api/v1/games"))
             if path == "/api/playlists":
