@@ -222,6 +222,15 @@ def cabinet_put_json(path, payload):
         except Exception:
             return {"raw": body.decode("utf-8", "replace")}
 
+def cabinet_delete_json(path):
+    req = urllib.request.Request(cabinet_base() + path, method="DELETE")
+    with upstream_open(req, timeout=60) as resp:
+        body = bounded_response(resp)
+        try:
+            return json.loads(body.decode("utf-8"))
+        except Exception:
+            return {"raw": body.decode("utf-8", "replace")}
+
 
 def _parse_play_date(s):
     """Parse a cabinet date like "Nov 8, 2026, 3:41:42 PM".
@@ -823,6 +832,36 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400,{"ok":False,"error":"Valid JSON object required"})
             except Exception as e:
                 return self._send(502, {"ok": False, "error": "Cabinet request unavailable"})
+        if path == "/api/playlists/save":
+            if self.headers.get('Content-Type','').split(';')[0].strip()!='application/json':
+                return self._send(415,{"ok":False,"error":"JSON content required"})
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                if not 0 < length <= 4096:
+                    raise ValueError()
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(payload, dict) or not set(payload) <= {"id", "name"} or "name" not in payload:
+                    raise ValueError()
+                name = payload["name"]
+                if not isinstance(name, str) or not 1 <= len(name.strip()) <= 120 or any(ord(c) < 32 for c in name):
+                    raise ValueError()
+                playlist_id = payload.get("id", -1)
+                if type(playlist_id) is not int or playlist_id < -1 or playlist_id == 0 or playlist_id > 2147483647:
+                    raise ValueError()
+            except (ValueError, UnicodeError):
+                return self._send(400, {"ok": False, "error": "Provide a playlist name and optional playlist id"})
+            try:
+                if playlist_id > 0:
+                    existing = cabinet_get("/api/v1/playlists")
+                    known = existing if isinstance(existing, list) else []
+                    if not any(isinstance(p, dict) and p.get("id") == playlist_id for p in known):
+                        return self._send(404, {"ok": False, "error": "Playlist not found"})
+                # Only id and name are forwarded: no SQL playlists, flags or
+                # media fields can be set through this route.
+                result = cabinet_post_json("/api/v1/playlists/save", {"id": playlist_id, "name": name.strip()})
+                return self._send(200, {"ok": True, "result": result})
+            except Exception:
+                return self._send(502, {"ok": False, "error": "Cabinet request unavailable"})
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "playlists":
             try:
                 result = cabinet_put_json(f"/api/v1/playlists/{parts[2]}/{parts[3]}/0", {})
@@ -909,6 +948,20 @@ class Handler(BaseHTTPRequestHandler):
             except urllib.error.HTTPError as e:
                 return self._send(e.code, {"ok": False, "error": "Cabinet rejected the upload"})
             except Exception as e:
+                return self._send(502, {"ok": False, "error": "Cabinet request unavailable"})
+        return self._send(404, {"ok": False, "error": "not found"})
+
+    def do_DELETE(self):
+        if not self._auth():
+            return
+        parts = [p for p in urlparse(self.path).path.split("/") if p]
+        # Only removing a table from a playlist is exposed. Playlist
+        # deletion and every other cabinet DELETE stay unreachable.
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "playlists" and valid_id(parts[2], allow_zero=True) and valid_id(parts[3]):
+            try:
+                result = cabinet_delete_json(f"/api/v1/playlists/{parts[2]}/{parts[3]}")
+                return self._send(200, {"ok": True, "result": result})
+            except Exception:
                 return self._send(502, {"ok": False, "error": "Cabinet request unavailable"})
         return self._send(404, {"ok": False, "error": "not found"})
 

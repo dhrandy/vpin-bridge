@@ -143,6 +143,8 @@ All endpoints, including `/health`, need the `X-Api-Key` header.
 | GET | `/api/reload/<gameId>` | Reload one table, use after uploading media so validation updates |
 | GET | `/api/playlists` | Playlists |
 | POST | `/api/playlists/<playlistId>/<gameId>` | Add a table to a playlist. Not blocked by `DRY_RUN`. |
+| POST | `/api/playlists/save` | Create or rename a playlist. JSON `{"id": -1, "name": "..."}`; id -1 creates, an existing id renames after a lookup confirms it. Only id and name are forwarded, so SQL playlists and flags cannot be set through this route. Not blocked by `DRY_RUN`. |
+| DELETE | `/api/playlists/<playlistId>/<gameId>` | Remove a table from a playlist. Playlist deletion and every other cabinet DELETE stay unreachable. Not blocked by `DRY_RUN`. |
 | POST | `/api/upload` | Multipart table archive (`.zip` / `.7z` / `.vpa`), fields `mode`, `gameId`, `emuId`, `objectId`, `assetType`. Forwards to the cabinet upload, then runs `/games/process`. Blocked by `DRY_RUN` and while a game is playing. |
 | POST | `/api/backglass` | Multipart `.directb2s` file |
 | POST | `/api/puppack` | Multipart PuP pack archive |
